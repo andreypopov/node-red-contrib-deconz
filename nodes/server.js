@@ -1,35 +1,45 @@
-var request = require('request');
-const DeconzSocket = require('../lib/deconz-socket');
+const got = require('got');
+
+const dotProp = require('dot-prop');
+const DeviceList = require('../src/runtime/DeviceList');
+const DeconzAPI = require("../src/runtime/DeconzAPI");
+const DeconzSocket = require("../src/runtime/DeconzSocket");
+const ConfigMigration = require("../src/migration/ConfigMigration");
 
 module.exports = function (RED) {
     class ServerNode {
-        constructor(n) {
-            RED.nodes.createNode(this, n);
+        constructor(config) {
+            RED.nodes.createNode(this, config);
+            let node = this;
+            node.config = config;
+            node.discoverProcessRunning = false;
 
-            var node = this;
-            node.items = undefined;
-            node.items_list = undefined;
-            node.discoverProcess = false;
-            node.name = n.name;
-            node.ip = n.ip;
-            node.port = n.port;
-            node.ws_port = n.ws_port;
-            node.secure = n.secure || false;
-
-            // Prior 1.2.0 the apikey was not stored in credentials
-            if (node.credentials.secured_apikey === undefined && n.apikey !== undefined) {
-                node.credentials.secured_apikey = n.apikey;
+            // Config migration
+            let configMigration = new ConfigMigration('deconz-server', node.config);
+            let migrationResult = configMigration.applyMigration(node.config, node);
+            if (Array.isArray(migrationResult.errors) && migrationResult.errors.length > 0) {
+                migrationResult.errors.forEach(error => console.error(error));
             }
-            node.devices = {};
+
+            node.device_list = new DeviceList();
+            node.api = new DeconzAPI({
+                ip: node.config.ip,
+                port: node.config.port,
+                key: node.credentials.secured_apikey
+            });
+
+            // Example : ["ea9cd132.08f36"]
+            node.nodesWithQuery = [];
+            node.nodesByDevicePath = {};
 
             node.setMaxListeners(255);
             node.refreshDiscoverTimer = null;
-            node.refreshDiscoverInterval = n.polling >= 3 ? n.polling * 1000 : 15000;
+            node.refreshDiscoverInterval = node.config.polling >= 3 ? node.config.polling * 1000 : 15000;
 
             node.socket = new DeconzSocket({
-                hostname: this.ip,
-                port: this.ws_port,
-                secure: this.secure
+                hostname: node.config.ip,
+                port: node.config.ws_port,
+                secure: node.config.secure || false
             });
 
             node.socket.on('close', (code, reason) => this.onSocketClose(code, reason));
@@ -41,169 +51,94 @@ module.exports = function (RED) {
 
             node.on('close', () => this.onClose());
 
-            node.discoverDevices(function () {
-            }, true);
-
-            this.refreshDiscoverTimer = setInterval(function () {
-                node.discoverDevices(function () {
-                }, true);
-            }, node.refreshDiscoverInterval);
-        }
-
-
-        discoverDevices(callback, forceRefresh = false) {
-            var node = this;
-
-            if (forceRefresh || node.items === undefined) {
-                node.discoverProcess = true;
-                // node.log('discoverDevices: Refreshing devices list');
-
-                var url = "http://" + node.ip + ":" + node.port + "/api/" + node.credentials.secured_apikey;
-                // node.log('discoverDevices: Requesting: ' + url);
-
-
-                request.get(url, function (error, result, data) {
-
-                    if (error) {
-                        node.discoverProcess = false;
-                        callback(false);
-                        return;
-                    }
-
-                    try {
-                        var dataParsed = JSON.parse(data);
-                    } catch (e) {
-                        node.discoverProcess = false;
-                        callback(false);
-                        return;
-                    }
-
-                    node.oldItemsList = node.items !== undefined ? node.items : undefined;
-                    node.items = [];
-                    if (dataParsed) {
-                        for (var index in dataParsed.sensors) {
-                            var prop = dataParsed.sensors[index];
-                            prop.device_type = 'sensors';
-                            prop.device_id = parseInt(index);
-
-                            if (node.oldItemsList !== undefined && prop.uniqueid in node.oldItemsList) {
-                            } else {
-                                node.items[prop.uniqueid] = prop;
-                                node.emit("onNewDevice", prop.uniqueid);
-                            }
-                            node.items[prop.uniqueid] = prop;
-                        }
-
-                        for (var index in dataParsed.lights) {
-                            var prop = dataParsed.lights[index];
-                            prop.device_type = 'lights';
-                            prop.device_id = parseInt(index);
-
-                            if (node.oldItemsList !== undefined && prop.uniqueid in node.oldItemsList) {
-                            } else {
-                                node.items[prop.uniqueid] = prop;
-                                node.emit("onNewDevice", prop.uniqueid);
-                            }
-                            node.items[prop.uniqueid] = prop;
-                        }
-
-                        for (var index in dataParsed.groups) {
-                            var prop = dataParsed.groups[index];
-                            prop.device_type = 'groups';
-                            var groupid = "group_" + parseInt(index);
-                            prop.device_id = groupid;
-                            prop.uniqueid = groupid;
-
-                            if (node.oldItemsList !== undefined && prop.uniqueid in node.oldItemsList) {
-                            } else {
-                                node.items[prop.uniqueid] = prop;
-                                node.emit("onNewDevice", prop.uniqueid);
-                            }
-                            node.items[prop.uniqueid] = prop;
-                        }
-                    }
-
-                    node.discoverProcess = false;
-                    callback(node.items);
-                    return node.items;
+            (async () => {
+                await node.discoverDevices({
+                    forceRefresh: true,
+                    initialDiscovery: true
                 });
-            } else {
-                node.log('discoverDevices: Using cached devices');
-                callback(node.items);
-                return node.items;
-            }
-        }
-
-        getDiscoverProcess() {
-            var node = this;
-            return node.discoverProcess;
-        }
-
-        getDevice(uniqueid) {
-            var node = this;
-            var result = false;
-            if (node.items !== undefined && node.items) {
-                for (var index in (node.items)) {
-                    var item = (node.items)[index];
-                    if (index === uniqueid) {
-                        result = item;
-                        break;
-                    }
-                }
-            }
-            return result;
-        }
-
-        getItemsList(callback, forceRefresh = false) {
-            var node = this;
-            node.discoverDevices(function (items) {
-                node.items_list = [];
-                Object.keys(items).forEach(function (index) {
-                    var prop = items[index];
-
-                    node.items_list.push({
-                        device_name: prop.name + ' : ' + prop.type,
-                        uniqueid: prop.uniqueid,
-                        meta: prop
+                this.refreshDiscoverTimer = setInterval(() => {
+                    node.discoverDevices({
+                        forceRefresh: true
                     });
-                });
+                }, node.refreshDiscoverInterval);
+            })();
+        }
+
+        async discoverDevices(opt) {
+            let node = this;
+            let options = Object.assign({
+                forceRefresh: false,
+                initialDiscovery: false,
+                callback: () => {
+                }
+            }, opt);
+
+            if (!(options.forceRefresh) || node.discoverProcessRunning) {
+                node.log('discoverDevices: Using cached devices');
+                return;
+            }
+
+            node.discoverProcessRunning = true;
+            const response = await got(node.api.url.main()).json();
+            node.device_list.parse(response);
+            node.log(`discoverDevices: Updated ${node.device_list.count}`);
+            node.discoverProcessRunning = false;
+        }
 
 
-                callback(node.items_list);
-                return node.items_list;
-            }, forceRefresh);
+        registerNodeByDevicePath(nodeID, device_path) {
+            let node = this;
+            if (!(device_path in node.nodesByDevicePath)) node.nodesByDevicePath[device_path] = [];
+            if (!node.nodesByDevicePath[device_path].includes(nodeID)) node.nodesByDevicePath[device_path].push(nodeID);
+        }
+
+        unregisterNodeByDevicePath(nodeID, device_path) {
+            let node = this;
+            let index = node.nodesByDevicePath[device_path].indexOf(nodeID);
+            if (index !== -1) node.nodesByDevicePath[device_path].splice(index, 1);
+        }
+
+        registerNodeWithQuery(nodeID) {
+            let node = this;
+            if (!node.nodesWithQuery.includes(nodeID)) node.nodesWithQuery.push(nodeID);
+        }
+
+        unregisterNodeWithQuery(nodeID) {
+            let node = this;
+            let index = node.nodesWithQuery.indexOf(nodeID);
+            if (index !== -1) node.nodesWithQuery.splice(index, 1);
         }
 
         onClose() {
-            var that = this;
+            let that = this;
             that.log('WebSocket connection closed');
             that.emit('onClose');
 
             clearInterval(that.refreshDiscoverTimer);
             that.socket.close();
-            that.socket = null;
+            that.socket = undefined;
         }
 
         onSocketPongTimeout() {
-            var that = this;
+            let that = this;
             that.warn('WebSocket connection timeout, reconnecting');
             that.emit('onSocketPongTimeout');
         }
 
         onSocketUnauthorized() {
-            var that = this;
+            let that = this;
             that.warn('WebSocket authentication failed');
             that.emit('onSocketUnauthorized');
         }
 
         onSocketError(err) {
-            var that = this;
+            let that = this;
             that.warn(`WebSocket error: ${err}`);
             that.emit('onSocketError');
         }
 
         onSocketClose(code, reason) {
-            var that = this;
+            let that = this;
             if (reason) { // don't bother the user unless there's a reason
                 that.warn(`WebSocket disconnected: ${code} - ${reason}`);
             }
@@ -211,50 +146,161 @@ module.exports = function (RED) {
         }
 
         onSocketOpen(err) {
-            var that = this;
+            let that = this;
             that.log(`WebSocket opened`);
             that.emit('onSocketOpen');
         }
 
-        onSocketMessage(dataParsed) {
-            var that = this;
-            that.emit('onSocketMessage', dataParsed);
+        updateDevice(device_path, dataParsed) {
+            let node = this;
+            let device = node.device_list.getDeviceByPath(device_path);
+            let changed = {};
 
-            if (dataParsed.r == "scenes") {
-                return;
+            if (dotProp.has(dataParsed, 'name')) {
+                device.name = dotProp.get(dataParsed, 'name');
+                changed.name = true;
             }
 
-            if (dataParsed.r == "groups") {
-                dataParsed.uniqueid = "group_" + dataParsed.id;
-            }
-
-            for (var nodeId in that.devices) {
-                var item = that.devices[nodeId];
-                var node = RED.nodes.getNode(nodeId);
-
-                if (dataParsed.uniqueid === item) {
-                    if (node && "server" in node) {
-                        //update server items db
-                        var serverNode = RED.nodes.getNode(node.server.id);
-                        if ("state" in dataParsed && dataParsed.state !== undefined && "items" in serverNode && dataParsed.uniqueid in serverNode.items) {
-                            serverNode.items[dataParsed.uniqueid].state = dataParsed.state;
-
-                            if (node.type === "deconz-input") {
-                                node.sendState(dataParsed);
-                            }
+            ['config', 'state'].forEach(function (key) {
+                if (dotProp.has(dataParsed, key)) {
+                    Object.keys(dotProp.get(dataParsed, key)).forEach(function (state_name) {
+                        let valuePath = key + '.' + state_name;
+                        let newValue = dotProp.get(dataParsed, valuePath);
+                        let oldValue = dotProp.get(device, valuePath);
+                        if (newValue !== oldValue) {
+                            if (!(key in changed)) changed[key] = [];
+                            changed[key].push(state_name);
+                            dotProp.set(device, valuePath, newValue);
                         }
-                    } else {
-                        console.log('ERROR: cant get ' + nodeId + ' node, removed from list');
-                        delete that.devices[nodeId];
+                    });
+                }
+            });
+            return changed;
+        }
 
-                        if (node && "server" in node) {
-                            var serverNode = RED.nodes.getNode(node.server.id);
-                            delete serverNode.items[dataParsed.uniqueid];
+        onSocketMessageChanged(dataParsed) {
+            let that = this;
+
+            let paths = {};
+            // Path by unique ID
+            if (dataParsed.uniqueid !== undefined) {
+                paths.uniqueid = that.device_list.getPathByDevice({
+                    device_type: dataParsed.r,
+                    uniqueid: dataParsed.uniqueid
+                });
+            }
+            // Path by device ID
+            if (dataParsed.id !== undefined) {
+                paths.device_id = that.device_list.getPathByDevice({
+                    device_type: dataParsed.r,
+                    device_id: dataParsed.id
+                });
+            }
+
+            let changed = that.updateDevice(paths.uniqueid || paths.device_id, dataParsed);
+
+            let visited = [];
+
+            for (const path of Object.values(paths)) {
+                // Handle nodesByDevicePath
+                if (that.nodesByDevicePath[path] !== undefined && that.nodesByDevicePath[path].length > 0) {
+                    for (const nodeID of that.nodesByDevicePath[path]) {
+                        // Make sure we don't send event twice TODO Used ?
+                        if (visited.includes(nodeID)) continue;
+                        visited.push(nodeID);
+
+                        let node = RED.nodes.getNode(nodeID);
+                        if (!node) {
+                            console.warn('ERROR: cant get ' + nodeID + ' node, removed from list nodesByDevicePath');
+                            that.unregisterNodeByDevicePath(nodeID, path);
+                            return;
+                        }
+
+                        let device = that.device_list.getDeviceByPath(path);
+                        if (node.type === "deconz-input") {
+                            node.handleDeconzEvent(
+                                device,
+                                changed,
+                                dataParsed
+                            );
+                        }
+                        //TODO Battery node
+                    }
+
+                }
+
+                /*
+                // Handle nodesWithQuery
+                that.nodesWithQuery.forEach(function (nodeID) {
+                    let node = RED.nodes.getNode(nodeID);
+                    if (!node) {
+                        console.warn('ERROR: cant get ' + nodeID + ' node, removed from list nodesWithQuery');
+                        that.unregisterNodeWithQuery(nodeID);
+                        return;
+                    }
+                    let device = that.device_list.getDeviceByPath(path);
+                    if (node.type === "deconz-input") {
+                        try {
+                            let query = RED.util.evaluateNodeProperty(
+                                node.config.query,
+                                node.config.search_type,
+                                node,
+                                {}, undefined
+                            );
+                            if (node.server.matchQuery(query, device)) {
+                                node.sendState(
+                                    device,
+                                    dataParsed,
+                                    false,
+                                    'state' in dataParsed,
+                                    'state' in dataParsed,
+                                    'config' in dataParsed || 'name' in dataParsed
+                                );
+                            }
+                        } catch (e) {
+                            node.status({fill: "red", shape: "ring", text: "Error, cant read query"});
                         }
                     }
-                }
+                });
+
+                 */
             }
 
+
+        }
+
+
+        onSocketMessageSceneCalled(dataParsed) {
+            console.warn("Need to implement onSocketMessageSceneCalled for " + JSON.stringify(dataParsed));
+            // TODO implement
+        }
+
+
+        onSocketMessage(dataParsed) {
+            let that = this;
+            that.emit('onSocketMessage', dataParsed); //Used by event node
+            switch (dataParsed.t) {
+                case "event":
+                    switch (dataParsed.e) {
+                        case "added":
+                        case "deleted":
+                            that.discoverDevices(undefined, true);
+                            break;
+                        case "changed":
+                            that.onSocketMessageChanged(dataParsed);
+                            break;
+                        case "scene-called":
+                            that.onSocketMessageSceneCalled(dataParsed);
+                            break;
+                        default:
+                            console.warn("Unknown event of type '" + dataParsed.e + "'. " + JSON.stringify(dataParsed));
+                            break;
+                    }
+                    break;
+                default:
+                    console.warn("Unknown message of type '" + dataParsed.t + "'. " + JSON.stringify(dataParsed));
+                    break;
+            }
         }
     }
 
